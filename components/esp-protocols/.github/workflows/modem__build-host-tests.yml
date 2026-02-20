@@ -1,0 +1,102 @@
+name: "esp-modem: build/host-tests"
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  build_esp_modem_examples:
+    if: contains(github.event.pull_request.labels.*.name, 'modem') || github.event_name == 'push'
+    name: Build examples
+    strategy:
+      matrix:
+        idf_ver: ["latest", "release-v4.4", "release-v5.0", "release-v5.1", "release-v5.2", "release-v5.3"]
+        example: ["pppos_client", "modem_console", "modem_tcp_client", "ap_to_pppos", "simple_cmux_client"]
+        exclude:
+          - idf_ver: "release-v4.4"
+            example: modem_tcp_client
+        include:
+          - idf_ver: "release-v5.0"
+            example: "simple_cmux_client"
+            warning: "Warning: The smallest app partition is nearly full"
+
+    runs-on: ubuntu-22.04
+    container: espressif/idf:${{ matrix.idf_ver }}
+    steps:
+      - name: Check out code (v3) # @v4 failed due to Node 20's requirement, incompatible with older IDF versions
+        if: matrix.idf_ver != 'latest' && matrix.idf_ver < 'release-v5.0'
+        uses: actions/checkout@v3
+        with:
+          path: protocols
+      - name: Check out code (v4)
+        if: matrix.idf_ver == 'latest' || matrix.idf_ver >= 'release-v5.0'
+        uses: actions/checkout@v4
+        with:
+          path: protocols
+      - if: ${{ matrix.skip_config }}
+        run: rm -f $GITHUB_WORKSPACE/protocols/components/esp_modem/examples/${{ matrix.example }}/sdkconfig.ci.${{ matrix.skip_config }}*
+      - name: Build ${{ matrix.example }} with IDF-${{ matrix.idf_ver }}
+        env:
+          EXPECTED_WARNING: ${{ matrix.warning }}
+        shell: bash
+        run: |
+          . ${IDF_PATH}/export.sh
+          python -m pip install idf-build-apps
+          cd $GITHUB_WORKSPACE/protocols
+          python ./ci/build_apps.py components/esp_modem/examples/${{ matrix.example }} -m components/esp_modem/.build-test-rules.yml
+
+  build_esp_modem_tests:
+    if: contains(github.event.pull_request.labels.*.name, 'modem') || github.event_name == 'push'
+    name: Build tests
+    strategy:
+      matrix:
+        idf_ver: ["release-v5.0", "release-v5.1", "release-v5.2", "release-v5.3", "latest"]
+        test: ["target", "target_ota", "target_iperf"]
+
+    runs-on: ubuntu-22.04
+    container: espressif/idf:${{ matrix.idf_ver }}
+    steps:
+      - name: Checkout esp-protocols
+        uses: actions/checkout@v4
+        with:
+          path: protocols
+      - name: Build ${{ matrix.test }} with IDF-${{ matrix.idf_ver }}
+        env:
+          EXPECTED_WARNING: ${{ matrix.warning }}
+        shell: bash
+        run: |
+          . ${IDF_PATH}/export.sh
+          python -m pip install idf-build-apps
+          cd $GITHUB_WORKSPACE/protocols
+          python ./ci/build_apps.py components/esp_modem/test/${{ matrix.test }} -m components/esp_modem/.build-test-rules.yml
+
+
+  host_test_esp_modem:
+    if: contains(github.event.pull_request.labels.*.name, 'modem') || github.event_name == 'push'
+    uses: "./.github/workflows/run-host-tests.yml"
+    with:
+        idf_version: "latest"
+        app_name: "host_modem_test"
+        app_path: "esp-protocols/components/esp_modem/test/host_test"
+        component_path: "esp-protocols/components/esp_modem"
+        upload_artifacts: true
+        run_executable: true
+        run_coverage: true
+        pre_run_script: "esp-protocols/components/esp_modem/test/host_test/env.sh"
+        publish_unit_test_result: true
+
+  build_linux_example:
+    if: contains(github.event.pull_request.labels.*.name, 'modem') || github.event_name == 'push'
+    uses: "./.github/workflows/run-host-tests.yml"
+    with:
+        idf_version: "latest"
+        app_name: "linux_modem"
+        app_path: "esp-protocols/components/esp_modem/examples/linux_modem"
+        component_path: "esp-protocols/components/esp_modem"
+        upload_artifacts: true
+        run_executable: false
+        run_coverage: false
+        pre_run_script: "esp-protocols/components/esp_modem/test/host_test/env.sh"
