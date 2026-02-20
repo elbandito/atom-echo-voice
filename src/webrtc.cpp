@@ -69,17 +69,14 @@ static void oai_onconnectionstatechange_task(PeerConnectionState state,
 }
 
 static void oai_on_icecandidate_task(char *description, void *user_data) {
-  ESP_LOGI(LOG_TAG, "ICE candidate ready, sending HTTP offer...");
   char local_buffer[MAX_HTTP_OUTPUT_BUFFER + 1] = {0};
   oai_http_request(description, local_buffer);
-  ESP_LOGI(LOG_TAG, "Got SDP answer (%d bytes)", (int)strlen(local_buffer));
   peer_connection_set_remote_description(peer_connection, local_buffer);
-  ESP_LOGI(LOG_TAG, "Remote description set");
 }
 
 static void send_session_update() {
   char msg[2048];
-  int written = snprintf(msg, sizeof(msg),
+  snprintf(msg, sizeof(msg),
       "{\"type\":\"session.update\",\"session\":{"
       "\"modalities\":[\"audio\",\"text\"],"
       "\"voice\":\"%s\","
@@ -89,82 +86,64 @@ static void send_session_update() {
       "\"turn_detection\":{\"type\":\"server_vad\"}}}",
       AGENT_VOICE, AGENT_INSTRUCTIONS);
 
-  ESP_LOGI(LOG_TAG, "Sending session.update (%d bytes)...", written);
-  ESP_LOGD(LOG_TAG, "session.update payload: %s", msg);
-  int ret = peer_connection_datachannel_send(peer_connection, msg, strlen(msg));
-  ESP_LOGI(LOG_TAG, "datachannel_send(session.update) returned: %d", ret);
+  peer_connection_datachannel_send(peer_connection, msg, strlen(msg));
 }
 
 static void send_response_create() {
   const char *msg =
       "{\"type\":\"response.create\",\"response\":"
       "{\"modalities\":[\"audio\",\"text\"]}}";
-  ESP_LOGI(LOG_TAG, "Sending response.create to trigger greeting...");
-  int ret = peer_connection_datachannel_send(peer_connection, (char *)msg, strlen(msg));
-  ESP_LOGI(LOG_TAG, "datachannel_send(response.create) returned: %d", ret);
+  peer_connection_datachannel_send(peer_connection, (char *)msg, strlen(msg));
+}
+
+// Fast check if a substring exists in a non-null-terminated buffer
+static bool buf_contains(const char *buf, size_t len, const char *needle) {
+  size_t nlen = strlen(needle);
+  if (nlen > len) return false;
+  for (size_t i = 0; i <= len - nlen; i++) {
+    if (memcmp(buf + i, needle, nlen) == 0) return true;
+  }
+  return false;
 }
 
 static void oai_ondatachannel_message(char *msg, size_t len, void *userdata,
                                       uint16_t sid) {
-  if (len == 0) {
-    ESP_LOGW(LOG_TAG, "DC recv: empty message (sid=%u)", sid);
-    return;
+  if (len == 0) return;
+
+  // Only handle events we care about — skip everything else fast
+  // Check the most frequent events first to return early
+  if (buf_contains(msg, len, "\"response.audio_transcript.delta\"") ||
+      buf_contains(msg, len, "\"response.audio.delta\"") ||
+      buf_contains(msg, len, "\"rate_limits.updated\"") ||
+      buf_contains(msg, len, "\"output_audio_buffer.")) {
+    return;  // High-frequency events — skip silently
   }
 
-  // Messages from SCTP are not null-terminated; make a safe copy for strstr
-  size_t safe_len = len < 4095 ? len : 4095;
-  char buf[4096];
-  memcpy(buf, msg, safe_len);
-  buf[safe_len] = '\0';
-
-  // Log every message type and a preview
-  ESP_LOGI(LOG_TAG, "DC recv (sid=%u, len=%d): %.200s%s",
-           sid, (int)len, buf, len > 200 ? "..." : "");
-
-  if (strstr(buf, "\"session.created\"")) {
-    ESP_LOGI(LOG_TAG, ">>> Event: session.created - sending session.update...");
+  if (buf_contains(msg, len, "\"session.created\"")) {
+    ESP_LOGI(LOG_TAG, "Session created, sending instructions...");
     send_session_update();
-  } else if (strstr(buf, "\"session.updated\"")) {
-    ESP_LOGI(LOG_TAG, ">>> Event: session.updated - session configured!");
+  } else if (buf_contains(msg, len, "\"session.updated\"")) {
+    ESP_LOGI(LOG_TAG, "Session configured");
     session_configured = true;
     if (!greeting_triggered) {
       greeting_triggered = true;
-      ESP_LOGI(LOG_TAG, "Triggering initial greeting...");
       send_response_create();
     }
-  } else if (strstr(buf, "\"response.created\"")) {
-    ESP_LOGI(LOG_TAG, ">>> Event: response.created");
-  } else if (strstr(buf, "\"response.audio.delta\"")) {
-    ESP_LOGD(LOG_TAG, ">>> Event: response.audio.delta (audio chunk)");
-  } else if (strstr(buf, "\"response.audio.done\"")) {
-    ESP_LOGI(LOG_TAG, ">>> Event: response.audio.done");
-  } else if (strstr(buf, "\"response.done\"")) {
-    ESP_LOGI(LOG_TAG, ">>> Event: response.done");
-  } else if (strstr(buf, "\"error\"")) {
-    ESP_LOGE(LOG_TAG, ">>> Event: ERROR: %s", buf);
-  } else {
-    // Extract type field for unknown events
-    const char *type_start = strstr(buf, "\"type\":\"");
-    if (type_start) {
-      type_start += 8; // skip past "type":"
-      const char *type_end = strchr(type_start, '"');
-      if (type_end) {
-        ESP_LOGI(LOG_TAG, ">>> Event: %.*s (unhandled)",
-                 (int)(type_end - type_start), type_start);
-      }
-    }
+  } else if (buf_contains(msg, len, "\"error\"")) {
+    // Need null-terminated copy only for error logging
+    size_t safe_len = len < 511 ? len : 511;
+    char buf[512];
+    memcpy(buf, msg, safe_len);
+    buf[safe_len] = '\0';
+    ESP_LOGE(LOG_TAG, "API error: %s", buf);
   }
 }
 
 static void oai_ondatachannel_open(void *userdata) {
-  ESP_LOGI(LOG_TAG, "=== Data channel OPENED (SCTP association up) ===");
+  ESP_LOGI(LOG_TAG, "Data channel open, negotiating...");
   session_configured = false;
   greeting_triggered = false;
-
-  ESP_LOGI(LOG_TAG, "Sending DATA_CHANNEL_OPEN with label 'oai-events'...");
-  int ret = peer_connection_datachannel_open(peer_connection, "oai-events", 0);
-  ESP_LOGI(LOG_TAG, "datachannel_open returned: %d", ret);
-  ESP_LOGI(LOG_TAG, "Waiting for session.created before sending instructions...");
+  peer_connection_datachannel_open(peer_connection, "oai-events", 0);
 }
 
 static void oai_ondatachannel_close(void *userdata) {
@@ -187,7 +166,6 @@ void oai_webrtc() {
       .user_data = NULL,
   };
 
-  ESP_LOGI(LOG_TAG, "Creating peer connection (datachannel=STRING, codec=OPUS)...");
   peer_connection = peer_connection_create(&peer_connection_config);
   if (peer_connection == NULL) {
     ESP_LOGE(LOG_TAG, "Failed to create peer connection");
@@ -195,7 +173,6 @@ void oai_webrtc() {
     esp_restart();
 #endif
   }
-  ESP_LOGI(LOG_TAG, "Peer connection created, registering callbacks...");
 
   peer_connection_oniceconnectionstatechange(peer_connection,
                                              oai_onconnectionstatechange_task);
@@ -203,9 +180,7 @@ void oai_webrtc() {
   peer_connection_ondatachannel(peer_connection, oai_ondatachannel_message,
                                 oai_ondatachannel_open,
                                 oai_ondatachannel_close);
-  ESP_LOGI(LOG_TAG, "Callbacks registered, creating SDP offer...");
   peer_connection_create_offer(peer_connection);
-  ESP_LOGI(LOG_TAG, "Entering peer connection loop...");
 
   while (1) {
     peer_connection_loop(peer_connection);
